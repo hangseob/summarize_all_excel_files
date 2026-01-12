@@ -39,29 +39,41 @@ def process_excel(app, file_path):
         wb = app.books.open(file_path, read_only=True, update_links=False)
         time.sleep(2) # Wait for DRM/Macros
         
-        # Find sheet containing "당일"
+        # 대상 시트 찾기 로직 수정
         sheet = None
+        # 1. 시트 이름 우선 순위: "신양식_NEW"
         for s in wb.sheets:
-            if "당일" in s.name:
+            if s.name == "신양식_NEW":
                 sheet = s
                 break
         
+        # 2. 첫 번째 행에 "일일 운용 보고서" 문구가 포함된 시트 찾기
         if not sheet:
-            # Fallback: look for "구분" in any sheet
             for s in wb.sheets:
                 try:
-                    v = s.used_range.value
-                    if v:
-                        # Flatten first 20 rows to look for "구분"
-                        flat_top = [str(c) for row in v[:20] for c in row if c]
-                        if "구분" in flat_top:
+                    # 첫 행(1행)의 값을 가져옴 (보통 A1:Z1 범위 확인)
+                    first_row = s.range("1:1").value
+                    if first_row:
+                        # 리스트 내에 "일일 운용 보고서" 문구가 포함된 셀이 있는지 확인
+                        if any("일일 운용 보고서" in str(cell) for cell in first_row if cell):
                             sheet = s
                             break
                 except:
                     continue
         
+        # 3. 기존 Fallback: "구분"이 있는 시트 검색
         if not sheet:
-            # Last resort: first sheet
+            for s in wb.sheets:
+                try:
+                    v = s.used_range.value
+                    if v:
+                        flat_top = [str(c) for row in v[:20] for c in row if c]
+                        if "구분" in flat_top:
+                            sheet = s
+                            break
+                except: continue
+        
+        if not sheet:
             sheet = wb.sheets[0]
 
         print(f"Using sheet: {sheet.name}")
@@ -86,13 +98,32 @@ def process_excel(app, file_path):
                     
                     section_type = "손익" if "손익" in section_header else "포지션"
                     
+                    # 값(Value)이 들어있는 컬럼 오프셋 찾기
+                    val_col_idx = c_idx + 1 # 기본값은 바로 옆 컬럼
+                    header_row = vals[r_idx]
+                    
+                    if section_type == "손익":
+                        # "일" 이라는 정확한 문구를 가진 컬럼 찾기
+                        for search_idx in range(c_idx + 1, len(header_row)):
+                            if header_row[search_idx] == "일":
+                                val_col_idx = search_idx
+                                break
+                    else:
+                        # "부서" 가 포함된 컬럼 찾기
+                        for search_idx in range(c_idx + 1, len(header_row)):
+                            if header_row[search_idx] and "부서" in str(header_row[search_idx]):
+                                val_col_idx = search_idx
+                                break
+                    
+                    print(f"  - Section [{section_type}] found. Name col: {c_idx}, Value col: {val_col_idx}")
+
                     section_sum_calc = 0
                     section_total_excel = None
                     
                     curr_r = r_idx + 1
                     while curr_r < len(vals):
                         name = vals[curr_r][c_idx]
-                        value = vals[curr_r][c_idx + 1]
+                        value = vals[curr_r][val_col_idx]
                         
                         # Handle "합계" row
                         if name and str(name).strip() == "합계":
@@ -120,11 +151,40 @@ def process_excel(app, file_path):
                     # 정합성 체크 (손익 섹션에 대해서만)
                     if section_type == "손익" and section_total_excel is not None:
                         diff = abs(section_sum_calc - section_total_excel)
-                        # 절사 고려하여 차이가 2 이하인 경우 정상으로 판단
                         if diff <= 2:
                             print(f"  [정합성 체크] {section_type}: 정상 (합계: {section_total_excel})")
                         else:
                             print(f"  [정합성 체크] {section_type}: 불일치! (계산: {section_sum_calc}, 엑셀: {section_total_excel}, 차이: {diff})")
+
+        # "조달금리 감안 총캐리" 추가 추출
+        for r_idx, row in enumerate(vals):
+            for c_idx, cell_val in enumerate(row):
+                if cell_val and ("조달금리" in str(cell_val) and "총캐리" in str(cell_val)):
+                    val_str = str(cell_val)
+                    # 1. 같은 셀 내에 숫자(및 마이너스 부호)가 있는지 확인
+                    match = re.search(r'[:\s]+([-?\d.]+)', val_str)
+                    if match:
+                        try:
+                            val = float(match.group(1).replace(',', ''))
+                            results.append({
+                                "date": date_str, "손익/포지션": "손익", "구분": "조달금리 감안 총캐리",
+                                "값": val, "통화": "KRW", "단위": unit
+                            })
+                            print(f"  - Found Carry P&L in cell: {val}")
+                        except: pass
+                    else:
+                        # 2. 같은 셀에 없으면 오른쪽 셀들 확인
+                        for offset in range(1, 5):
+                            if c_idx + offset < len(row):
+                                f_val = to_float(row[c_idx + offset])
+                                if f_val is not None and f_val != 0:
+                                    results.append({
+                                        "date": date_str, "손익/포지션": "손익", "구분": "조달금리 감안 총캐리",
+                                        "값": f_val, "통화": "KRW", "단위": unit
+                                    })
+                                    print(f"  - Found Carry P&L in neighbor cell: {f_val}")
+                                    break
+                    break
 
         return results
 
